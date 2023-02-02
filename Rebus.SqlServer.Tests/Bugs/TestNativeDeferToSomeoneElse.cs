@@ -24,7 +24,7 @@ public class TestNativeDeferToSomeoneElse : FixtureBase
 
     [TestCase(true)]
     [TestCase(false)]
-    public async Task ItWorks_SetDestinationHeaderFromTheOutside(bool usePipelineStep)
+    public async Task ItWorks_SetDestinationHeaderFromTheOutside_WithOneWaySender_AndSqlServerNativeTimeouts(bool usePipelineStep)
     {
         var receiver = new BuiltinHandlerActivator();
 
@@ -37,6 +37,101 @@ public class TestNativeDeferToSomeoneElse : FixtureBase
         var senderBus = Configure.With(new BuiltinHandlerActivator())
             .Transport(x => x.UseSqlServerAsOneWayClient(new SqlServerTransportOptions(ConnectionString)))
             .Routing(r => r.TypeBased().Map<string>("receiver"))
+            .Options(o =>
+            {
+                if (usePipelineStep)
+                {
+                    o.Decorate<IPipeline>(c =>
+                    {
+                        var pipeline = c.Get<IPipeline>();
+                        var step = new AutoDeferredRecipientStep(c.Get<IRouter>());
+
+                        return new PipelineStepConcatenator(pipeline)
+                            .OnSend(step, PipelineAbsolutePosition.Front);
+                    });
+                }
+            })
+            .Start();
+
+        Using(senderBus);
+
+        var gotTheString = new ManualResetEvent(false);
+
+        receiver.Handle<string>(async message => gotTheString.Set());
+        receiverStarter.Start();
+
+        var optionalHeaders = usePipelineStep
+            ? new Dictionary<string, string>()
+            : new Dictionary<string, string> { { Headers.DeferredRecipient, "receiver" } };
+
+        await senderBus.Defer(TimeSpan.FromSeconds(1), "HEEELOOOOOO", optionalHeaders);
+
+        gotTheString.WaitOrDie(TimeSpan.FromSeconds(5));
+    }
+
+    [TestCase(true)] // fail
+    [TestCase(false)] // success
+    public async Task ItWorks_SetDestinationHeaderFromTheOutside_WithTwoWaySender_AndSqlServerNativeTimeouts(bool usePipelineStep)
+    {
+        var receiver = new BuiltinHandlerActivator();
+
+        Using(receiver);
+
+        var receiverStarter = Configure.With(receiver)
+            .Transport(t => t.UseSqlServer(new SqlServerTransportOptions(ConnectionString), "receiver"))
+            .Create();
+
+        var senderBus = Configure.With(new BuiltinHandlerActivator())
+            .Transport(x => x.UseSqlServer(new SqlServerTransportOptions(ConnectionString), "sender"))
+            .Routing(r => r.TypeBased().Map<string>("sender"))  // all messages should go to sender unless they are deferred to another queue
+            .Options(o =>
+            {
+                if (usePipelineStep)
+                {
+                    o.Decorate<IPipeline>(c =>
+                    {
+                        var pipeline = c.Get<IPipeline>();
+                        var step = new AutoDeferredRecipientStep(c.Get<IRouter>());
+
+                        return new PipelineStepConcatenator(pipeline)
+                            .OnSend(step, PipelineAbsolutePosition.Front);
+                    });
+                }
+            })
+            .Start();
+
+        Using(senderBus);
+
+        var gotTheString = new ManualResetEvent(false);
+
+        receiver.Handle<string>(async message => gotTheString.Set());
+        receiverStarter.Start();
+
+        var optionalHeaders = usePipelineStep
+            ? new Dictionary<string, string>()
+            : new Dictionary<string, string> { { Headers.DeferredRecipient, "receiver" } };
+
+        await senderBus.Defer(TimeSpan.FromSeconds(1), "HEEELOOOOOO", optionalHeaders);
+
+        gotTheString.WaitOrDie(TimeSpan.FromSeconds(5));
+    }
+
+    [TestCase(true)] // fail
+    [TestCase(false)] // fail
+    public async Task ItWorks_SetDestinationHeaderFromTheOutside_WithTwoWaySender_AndSqlServerTimeoutManager(bool usePipelineStep)
+    {
+        var receiver = new BuiltinHandlerActivator();
+
+        Using(receiver);
+
+        var receiverStarter = Configure.With(receiver)
+            .Transport(t => t.UseSqlServer(new SqlServerTransportOptions(ConnectionString), "receiver"))
+            .Create();
+
+        var senderBus = Configure.With(new BuiltinHandlerActivator())
+            .Transport(x => x.UseSqlServer(new SqlServerTransportOptions(ConnectionString).DisableNativeTimeoutManager(), "sender"))
+            .Routing(r => r.TypeBased().Map<string>("sender")) // all messages should go to sender unless they are deferred to another queue
+            .Timeouts(t => t.StoreInSqlServer(new SqlServerTimeoutManagerOptions(ConnectionString), "timeouts"))
             .Options(o =>
             {
                 if (usePipelineStep)
@@ -83,11 +178,13 @@ public class TestNativeDeferToSomeoneElse : FixtureBase
             var message = context.Load<Message>();
             if (message.Headers.TryGetValue(Headers.DeferredUntil, out _))
             {
+                // DeferredRecipient header is always set at this point
                 if (!message.Headers.TryGetValue(Headers.DeferredRecipient, out var temp)
                     || temp == null)
                 {
                     try
                     {
+                        // this is never hit
                         message.Headers[Headers.DeferredRecipient] = await _router.GetDestinationAddress(message);
                     }
                     catch (Exception exception)
